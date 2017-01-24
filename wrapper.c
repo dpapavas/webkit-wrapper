@@ -142,7 +142,6 @@ GdkFilterReturn event_filter (GdkXEvent *xevent, GdkEvent *event, gpointer data)
             XWindowAttributes wa;
 
             XGetWindowAttributes(e->xany.display, e->xany.window, &wa);
-
             window_surface = cairo_xlib_surface_create (e->xany.display,
                                                         e->xany.window,
                                                         wa.visual,
@@ -150,6 +149,7 @@ GdkFilterReturn event_filter (GdkXEvent *xevent, GdkEvent *event, gpointer data)
                                                         wa.height);
 
             cr = cairo_create(window_surface);
+
             cairo_scale (cr,
                          (double)wa.width /
                          cairo_image_surface_get_width (icon_surface),
@@ -157,7 +157,7 @@ GdkFilterReturn event_filter (GdkXEvent *xevent, GdkEvent *event, gpointer data)
                          cairo_image_surface_get_height (icon_surface));
 
             cairo_surface_flush(icon_surface);
-            cairo_set_source_surface(cr, icon_surface, 1, 1);
+            cairo_set_source_surface(cr, icon_surface, 0, 0);
             cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BEST);
             cairo_paint (cr);
             cairo_destroy(cr);
@@ -221,16 +221,6 @@ static gboolean get_favicon(WebKitWebView *view,
         XEvent ev;
         int screen;
 
-        icon = gdk_window_new(NULL, &wa, GDK_WA_WMCLASS);
-        gdk_window_add_filter (icon, event_filter, NULL);
-
-        {
-            GList *icon_list = NULL;
-
-            icon_list = g_list_append (icon_list, pixbuf);
-            gdk_window_set_icon_list (icon, icon_list);
-        }
-
         display = gdk_x11_get_default_xdisplay();
         screen = gdk_x11_get_default_screen();
 
@@ -250,6 +240,42 @@ static gboolean get_favicon(WebKitWebView *view,
         tray = XGetSelectionOwner(display, _NET_SYSTEM_TRAY_Sn);
 
         g_debug ("Tray: %d\n", (int)tray);
+
+        {
+            GdkScreen *gdk_screen;
+            Atom _NET_SYSTEM_TRAY_VISUAL, XA_VISUALID, type;
+            int format;
+            unsigned long n, m;
+            VisualID id;
+
+            _NET_SYSTEM_TRAY_VISUAL = gdk_x11_get_xatom_by_name("_NET_SYSTEM_TRAY_VISUAL");
+            XA_VISUALID = gdk_x11_get_xatom_by_name("XA_VISUALID");
+
+            XGetWindowProperty(display, tray, _NET_SYSTEM_TRAY_VISUAL,
+                               0, 65536, False, XA_VISUALID, &type, &format,
+                               &n, &m, (unsigned char **)&id);
+
+            g_debug ("VisualID: %x\n", (unsigned int)id);
+            gdk_screen = gdk_screen_get_default();
+
+            if (id) {
+                wa.visual = gdk_x11_screen_lookup_visual (gdk_screen, id);
+            } else {
+                wa.visual = gdk_screen_get_system_visual (gdk_screen);
+            }
+        }
+
+        icon = gdk_window_new(NULL, &wa, GDK_WA_WMCLASS | GDK_WA_VISUAL);
+        gdk_window_add_filter (icon, event_filter, NULL);
+
+        {
+            GList *icon_list = NULL;
+
+            icon_list = g_list_append (icon_list, pixbuf);
+            gdk_window_set_icon_list (icon, icon_list);
+        }
+
+        XSetWindowBackgroundPixmap(display, GDK_WINDOW_XID(icon), ParentRelative);
 
         {
             unsigned long xembed_info[2];
@@ -321,7 +347,8 @@ static gboolean context_menu_handler (WebKitWebView *view,
         return FALSE;
     } else {
         return !(webkit_hit_test_result_context_is_editable(hit_test_result) ||
-                 webkit_hit_test_result_context_is_selection(hit_test_result));
+                 webkit_hit_test_result_context_is_selection(hit_test_result) ||
+                 webkit_hit_test_result_context_is_link(hit_test_result));
     }
 }
 
