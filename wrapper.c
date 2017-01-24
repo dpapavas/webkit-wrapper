@@ -167,7 +167,10 @@ GdkFilterReturn event_filter (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 
             g_debug("Updated the status icon.\n");
         }
+        break;
 
+    case ButtonPress: case ButtonRelease:
+        g_debug("Button pressed.\n");
         break;
     default: break;
     }
@@ -207,7 +210,8 @@ static gboolean get_favicon(WebKitWebView *view,
         GdkWindowAttr wa = {
             .width = 0,
             .height = 0,
-            .event_mask = GDK_EXPOSURE_MASK | GDK_STRUCTURE_MASK,
+            .event_mask = (GDK_EXPOSURE_MASK | GDK_STRUCTURE_MASK |
+                           GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK),
             .override_redirect = TRUE,
             .wclass = GDK_INPUT_OUTPUT,
             .window_type = GDK_WINDOW_TOPLEVEL,
@@ -265,7 +269,8 @@ static gboolean get_favicon(WebKitWebView *view,
             }
         }
 
-        icon = gdk_window_new(NULL, &wa, GDK_WA_WMCLASS | GDK_WA_VISUAL);
+        icon = gdk_window_new(NULL, &wa,
+                              GDK_WA_WMCLASS | GDK_WA_VISUAL | GDK_WA_NOREDIR);
         gdk_window_add_filter (icon, event_filter, NULL);
 
         {
@@ -290,15 +295,13 @@ static gboolean get_favicon(WebKitWebView *view,
                             (unsigned char*)xembed_info, 2);
         }
 
-#define SYSTEM_TRAY_REQUEST_DOCK 0
-
         memset(&ev, 0, sizeof(ev));
         ev.xclient.type = ClientMessage;
         ev.xclient.window = tray;
         ev.xclient.message_type = _NET_SYSTEM_TRAY_OPCODE;
         ev.xclient.format = 32;
         ev.xclient.data.l[0] = CurrentTime;
-        ev.xclient.data.l[1] = SYSTEM_TRAY_REQUEST_DOCK;
+        ev.xclient.data.l[1] = 0;      /* SYSTEM_TRAY_REQUEST_DOCK */
         ev.xclient.data.l[2] = gdk_x11_window_get_xid (icon);
         ev.xclient.data.l[3] = 0;
         ev.xclient.data.l[4] = 0;
@@ -329,7 +332,8 @@ static gboolean context_menu_handler (WebKitWebView *view,
                                       WebKitHitTestResult *hit_test_result,
                                       gpointer user_data)
 {
-    if (webkit_hit_test_result_context_is_image(hit_test_result)) {
+    if (webkit_hit_test_result_context_is_image(hit_test_result) ||
+        webkit_hit_test_result_context_is_link(hit_test_result)) {
         GList *l, *n;
 
         for (l = webkit_context_menu_get_items(menu) ; l ; l = n) {
@@ -339,7 +343,8 @@ static gboolean context_menu_handler (WebKitWebView *view,
             a = webkit_context_menu_item_get_stock_action(l->data);
 
             if (a != WEBKIT_CONTEXT_MENU_ACTION_COPY_IMAGE_TO_CLIPBOARD &&
-                a != WEBKIT_CONTEXT_MENU_ACTION_COPY_IMAGE_URL_TO_CLIPBOARD) {
+                a != WEBKIT_CONTEXT_MENU_ACTION_COPY_IMAGE_URL_TO_CLIPBOARD &&
+                a != WEBKIT_CONTEXT_MENU_ACTION_COPY_LINK_TO_CLIPBOARD) {
                 webkit_context_menu_remove(menu, l->data);
             }
         }
@@ -347,8 +352,7 @@ static gboolean context_menu_handler (WebKitWebView *view,
         return FALSE;
     } else {
         return !(webkit_hit_test_result_context_is_editable(hit_test_result) ||
-                 webkit_hit_test_result_context_is_selection(hit_test_result) ||
-                 webkit_hit_test_result_context_is_link(hit_test_result));
+                 webkit_hit_test_result_context_is_selection(hit_test_result));
     }
 }
 
