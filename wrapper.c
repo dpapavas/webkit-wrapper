@@ -3,11 +3,11 @@
 #include <string.h>
 
 #include <gdk/gdkx.h>
-#include <gdk-pixbuf-xlib/gdk-pixbuf-xlib.h>
+#include <cairo/cairo-xlib.h>
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
 
-static GdkPixbuf *icon_pixbuf;
+static cairo_surface_t* icon_surface;
 
 static gchar *languages[2][8];
 static gboolean permissions[4];
@@ -131,35 +131,43 @@ static gboolean close_web_view(WebKitWebView *view, GtkWidget *window)
 GdkFilterReturn event_filter (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 {
     XEvent *e;
-    GdkPixbuf *scaled;
-    Window root;
-    int x, y;
-    unsigned int width, height;
-    unsigned int border_width;
-    unsigned int depth;
 
     e = (XEvent *)xevent;
 
     switch(e->type) {
     case Expose:
-        XGetGeometry(e->xany.display, e->xany.window, &root,
-                     &x, &y, &width, &height, &border_width, &depth);
-        if((scaled = gdk_pixbuf_scale_simple(icon_pixbuf, width, height,
-                                             GDK_INTERP_BILINEAR))) {
-            gdk_pixbuf_xlib_render_to_drawable_alpha(scaled,
-                                                     e->xany.window,
-                                                     0, 0,
-                                                     0, 0,
-                                                     width, height,
-                                                     GDK_PIXBUF_ALPHA_FULL,
-                                                     0,
-                                                     XLIB_RGB_DITHER_NONE,
-                                                     0, 0);
+        {
+            cairo_surface_t *window_surface;
+            cairo_t *cr;
+            XWindowAttributes wa;
 
-            g_object_unref(scaled);
+            XGetWindowAttributes(e->xany.display, e->xany.window, &wa);
+
+            window_surface = cairo_xlib_surface_create (e->xany.display,
+                                                        e->xany.window,
+                                                        wa.visual,
+                                                        wa.width,
+                                                        wa.height);
+
+            cr = cairo_create(window_surface);
+            cairo_scale (cr,
+                         (double)wa.width /
+                         cairo_image_surface_get_width (icon_surface),
+                         (double)wa.height /
+                         cairo_image_surface_get_height (icon_surface));
+
+            cairo_surface_flush(icon_surface);
+            cairo_set_source_surface(cr, icon_surface, 1, 1);
+            cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BEST);
+            cairo_paint (cr);
+            cairo_destroy(cr);
+
+            cairo_surface_finish (window_surface);
+            cairo_surface_destroy(window_surface);
+
+            g_debug("Updated the status icon.\n");
         }
 
-        g_debug("Expose (%p), %d, %d.\n", event->any.window, width, height);
         break;
     default: break;
     }
@@ -171,103 +179,111 @@ static gboolean get_favicon(WebKitWebView *view,
                             GParamSpec *pspec,
                             GtkWindow *window)
 {
-    cairo_surface_t* surface;
+    GdkPixbuf *pixbuf;
 
-    if(icon_pixbuf) {
-        g_object_unref (icon_pixbuf);
+    g_debug ("Favicon is available.");
+
+    if(icon_surface) {
+        g_object_unref (icon_surface);
     }
 
-    if ((surface = webkit_web_view_get_favicon (view)) &&
-        (icon_pixbuf = gdk_pixbuf_get_from_surface (
-            surface, 0, 0,
-            cairo_image_surface_get_width (surface),
-            cairo_image_surface_get_height (surface)))
-        ) {
-        gtk_window_set_icon (window, icon_pixbuf);
+    if (!(icon_surface = webkit_web_view_get_favicon (view))) {
+        g_debug ("Could not get favicon surface.");
+        return TRUE;
+    }
+
+    if ((pixbuf = gdk_pixbuf_get_from_surface (
+            icon_surface, 0, 0,
+            cairo_image_surface_get_width (icon_surface),
+            cairo_image_surface_get_height (icon_surface)))) {
+        gtk_window_set_icon (window, pixbuf);
+        g_object_unref(pixbuf);
+    } else {
+        g_debug ("Could not use favicon to set application window icon.");
+    }
+
+    {
+        GdkWindow *icon;
+        GdkWindowAttr wa = {
+            .width = 0,
+            .height = 0,
+            .event_mask = GDK_EXPOSURE_MASK | GDK_STRUCTURE_MASK,
+            .override_redirect = TRUE,
+            .wclass = GDK_INPUT_OUTPUT,
+            .window_type = GDK_WINDOW_TOPLEVEL,
+            .wmclass_name = "foo",
+            .wmclass_class = "Foo"
+        };
+
+        Display *display;
+        Window tray;
+        Atom _NET_SYSTEM_TRAY_Sn, _NET_SYSTEM_TRAY_OPCODE, _XEMBED_INFO;
+        XEvent ev;
+        int screen;
+
+        icon = gdk_window_new(NULL, &wa, GDK_WA_WMCLASS);
+        gdk_window_add_filter (icon, event_filter, NULL);
 
         {
-            GdkWindow *icon;
-            GdkWindowAttr wa = {
-                .width = 0,
-                .height = 0,
-                .event_mask = GDK_EXPOSURE_MASK | GDK_STRUCTURE_MASK,
-                .override_redirect = TRUE,
-                .wclass = GDK_INPUT_OUTPUT,
-                .window_type = GDK_WINDOW_TOPLEVEL,
-                .wmclass_name = "foo",
-                .wmclass_class = "Foo"
-            };
+            GList *icon_list = NULL;
 
-            Display *display;
-            Window tray;
-            Atom _NET_SYSTEM_TRAY_Sn, _NET_SYSTEM_TRAY_OPCODE;
-            XEvent ev;
-            int screen;
+            icon_list = g_list_append (icon_list, pixbuf);
+            gdk_window_set_icon_list (icon, icon_list);
+        }
 
-            icon = gdk_window_new(NULL, &wa, GDK_WA_WMCLASS);
-            gdk_window_add_filter (icon, event_filter, NULL);
+        display = gdk_x11_get_default_xdisplay();
+        screen = gdk_x11_get_default_screen();
 
-            {
-                GList *icon_list = NULL;
-                GdkRGBA rgba = {1, 0, 0, 1};
+        {
+            gchar *name;
 
-                icon_list = g_list_append (icon_list, icon_pixbuf);
-                gdk_window_set_icon_list (icon, icon_list);
-                /* g_list_free(icon_list); */
+            name = g_strdup_printf("_NET_SYSTEM_TRAY_S%d", screen);
+            _NET_SYSTEM_TRAY_Sn = gdk_x11_get_xatom_by_name(name);
+            g_free(name);
+        }
 
-                gdk_window_set_background_rgba(icon, &rgba);
-            }
+        _NET_SYSTEM_TRAY_OPCODE = gdk_x11_get_xatom_by_name("_NET_SYSTEM_TRAY_OPCODE");
+        _XEMBED_INFO = gdk_x11_get_xatom_by_name("_XEMBED_INFO");
 
-            display = gdk_x11_get_default_xdisplay();
-            screen = gdk_x11_get_default_screen();
+        g_debug ("Atoms: %d, %d\n", (int)_NET_SYSTEM_TRAY_Sn, (int)_NET_SYSTEM_TRAY_OPCODE);
 
-            gdk_pixbuf_xlib_init (display, screen);
+        tray = XGetSelectionOwner(display, _NET_SYSTEM_TRAY_Sn);
 
-            _NET_SYSTEM_TRAY_Sn = gdk_x11_get_xatom_by_name("_NET_SYSTEM_TRAY_S0");
-            _NET_SYSTEM_TRAY_OPCODE = gdk_x11_get_xatom_by_name("_NET_SYSTEM_TRAY_OPCODE");
+        g_debug ("Tray: %d\n", (int)tray);
 
-            g_debug ("Atoms: %d, %d\n", (int)_NET_SYSTEM_TRAY_Sn, (int)_NET_SYSTEM_TRAY_OPCODE);
+        {
+            unsigned long xembed_info[2];
 
-            tray = XGetSelectionOwner(display, _NET_SYSTEM_TRAY_Sn);
-
-            g_debug ("Tray: %d\n", (int)tray);
-
-            {
-                unsigned long xembed_info[2];
-
-                //Set XEMBED info
-                xembed_info[0] = 0;
-                xembed_info[1] = 1;
-                XChangeProperty(display,
-                                gdk_x11_window_get_xid (icon),
-                                XInternAtom(display, "_XEMBED_INFO", False ),
-                                XInternAtom(display, "_XEMBED_INFO", False ),
-                                32, PropModeReplace, (unsigned char*)xembed_info, 2);
-            }
+            //Set XEMBED info
+            xembed_info[0] = 0;
+            xembed_info[1] = 1;
+            XChangeProperty(display,
+                            gdk_x11_window_get_xid (icon),
+                            _XEMBED_INFO, _XEMBED_INFO,
+                            32, PropModeReplace,
+                            (unsigned char*)xembed_info, 2);
+        }
 
 #define SYSTEM_TRAY_REQUEST_DOCK 0
 
-            memset(&ev, 0, sizeof(ev));
-            ev.xclient.type = ClientMessage;
-            ev.xclient.window = tray;
-            ev.xclient.message_type = _NET_SYSTEM_TRAY_OPCODE;
-            ev.xclient.format = 32;
-            ev.xclient.data.l[0] = CurrentTime;
-            ev.xclient.data.l[1] = SYSTEM_TRAY_REQUEST_DOCK;
-            ev.xclient.data.l[2] = gdk_x11_window_get_xid (icon);
-            ev.xclient.data.l[3] = 0;
-            ev.xclient.data.l[4] = 0;
+        memset(&ev, 0, sizeof(ev));
+        ev.xclient.type = ClientMessage;
+        ev.xclient.window = tray;
+        ev.xclient.message_type = _NET_SYSTEM_TRAY_OPCODE;
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = CurrentTime;
+        ev.xclient.data.l[1] = SYSTEM_TRAY_REQUEST_DOCK;
+        ev.xclient.data.l[2] = gdk_x11_window_get_xid (icon);
+        ev.xclient.data.l[3] = 0;
+        ev.xclient.data.l[4] = 0;
 
-            /* trap_errors(); */
-            XSendEvent(display, tray, False, NoEventMask, &ev);
-            XSync(display, False);
+        /* trap_errors(); */
+        XSendEvent(display, tray, False, NoEventMask, &ev);
+        XSync(display, False);
 
-            /* if (untrap_errors()) { */
-            /*     /\* Handle failure *\/ */
-            /* } */
-        }
-
-        g_debug ("Set application icon from site favicon.\n");
+        /* if (untrap_errors()) { */
+        /*     /\* Handle failure *\/ */
+        /* } */
     }
 
     return TRUE;
