@@ -2,15 +2,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <gdk/gdkx.h>
-#include <cairo/cairo-xlib.h>
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
+#include <JavaScriptCore/JavaScript.h>
 
-static cairo_surface_t* icon_surface;
+static GtkStatusIcon *status_icon;
+static cairo_surface_t *favicon_surface;
+static int notifications, alert, want_status_icon;
+
+static GSList *assets[2];
 
 static gchar *languages[2][8];
 static gboolean permissions[4];
+static gdouble zoom = 1.0;
 
 static gboolean permission_request (WebKitWebView *web_view,
                                     WebKitPermissionRequest *request,
@@ -51,13 +55,180 @@ static gboolean permission_request (WebKitWebView *web_view,
     return TRUE;
 }
 
+static void update_status_icon(const char *new_title,
+                               bool update_icon,
+                               bool update_notifications,
+                               bool update_alert)
+{
+    GdkPixbuf *pixbuf;
+
+    cairo_t *cr;
+    cairo_surface_t *destination;
+    cairo_text_extents_t extents;
+
+    const char *t;
+    char *s;
+
+    int i, w, h, size;
+
+    if (new_title) {
+        gtk_status_icon_set_title (status_icon, new_title);
+    }
+
+    /* Update the tooltip, if necessary. */
+
+    if (new_title || update_notifications) {
+        t = gtk_status_icon_get_title(status_icon);
+
+        if (notifications > 0) {
+            s = g_strdup_printf("%d notifications", notifications);
+        } else {
+            s = NULL;
+        }
+
+        if (t && s) {
+            char *ts;
+
+            ts = g_strconcat(t, " - ", s, NULL);
+
+            gtk_status_icon_set_tooltip_text (status_icon, ts);
+
+            g_free(s);
+            g_free(ts);
+        } else if (s) {
+            gtk_status_icon_set_tooltip_text (status_icon, s);
+            g_free(s);
+        } else {
+            gtk_status_icon_set_tooltip_text (status_icon, t);
+        }
+    }
+
+    if (!update_icon && !update_notifications && !update_alert) {
+        return;
+    }
+
+    /* Proceed to update the status icon, if necessary. */
+
+    if (!favicon_surface || !gtk_status_icon_is_embedded (status_icon)) {
+        g_debug("Status icon is not available\n");
+        return;
+    }
+
+    size = gtk_status_icon_get_size (status_icon);
+
+    if (size == 0) {
+        g_debug("Status icon has zero size.  Won't update.\n");
+        return;
+    }
+
+    /* Draw the favicon. */
+
+    w = cairo_image_surface_get_width (favicon_surface);
+    h = cairo_image_surface_get_height (favicon_surface);
+
+    destination = cairo_surface_create_similar (favicon_surface,
+                                                CAIRO_CONTENT_COLOR_ALPHA,
+                                                size, size);
+    cr = cairo_create (destination);
+    cairo_scale(cr, (double)size / w, (double)size / h);
+    cairo_set_source_surface (cr, favicon_surface, 0, 0);
+    cairo_paint(cr);
+
+    /* Draw the notification text. */
+
+    if (notifications > 0 || alert) {
+        char text[2] = "!";
+
+        if (notifications < 10 && !alert) {
+            text[0] = notifications + '0';
+        }
+
+        cairo_identity_matrix(cr);
+        cairo_select_font_face(cr, "Sans",
+                               CAIRO_FONT_SLANT_NORMAL,
+                               CAIRO_FONT_WEIGHT_BOLD);
+
+        for (i = 1 ; i >= 0 ; i -= 1) {
+            double delta;
+
+            if (i == 1) {
+                cairo_set_source_rgba(cr, 0, 0, 0, .8);
+            } else {
+                cairo_set_source_rgba(cr,  1.0000, 0.6936, 0.0000, 1);
+            }
+
+            cairo_set_font_size(cr, (1 + i * 0.1) * size);
+            cairo_text_extents(cr, text, &extents);
+
+            delta = (double)i * size / 10.0;
+            cairo_move_to(cr,
+                          (size - extents.width) / 2.0 - extents.x_bearing + delta,
+                          size - (size - extents.height) / 2.0 + delta);
+
+            cairo_show_text (cr, text);
+        }
+    }
+
+    cairo_destroy(cr);
+
+    g_debug("Icon size is: %d\n", size);
+
+    if ((pixbuf = gdk_pixbuf_get_from_surface (destination,
+                                               0, 0, size, size))) {
+        gtk_status_icon_set_from_pixbuf (status_icon, pixbuf);
+        g_object_unref(pixbuf);
+    } else {
+        g_debug ("Could not use favicon to set application window icon.");
+    }
+
+    cairo_surface_destroy (destination);
+}
+
+static gboolean status_icon_activated (GtkStatusIcon *status_icon,
+                                       GtkWindow *window)
+{
+    g_debug("Status icon clicked.\n");
+    gtk_window_present(window);
+
+    return TRUE;
+}
+
+static gboolean status_icon_size_changed (GtkStatusIcon *status_icon,
+                                          gint size, gpointer user_data)
+{
+    g_debug("Status icon size changed to %d.\n", size);
+    update_status_icon(NULL, TRUE, FALSE, FALSE);
+
+    return TRUE;
+}
+
+static void notification_closed (WebKitNotification *notification,
+                                 gpointer user_data)
+{
+    notifications -= 1;
+
+    if (status_icon) {
+        update_status_icon(NULL, FALSE, TRUE, FALSE);
+    }
+
+    g_debug("Notification closed (%d active).\n", notifications);
+}
+
+
 static gboolean show_notification (WebKitWebView *view,
                                    WebKitNotification *notification,
                                    gpointer user_data)
 {
-    /* printf ("**** %s\n%s\n", */
-    /*         webkit_notification_get_title (notification), */
-    /*         webkit_notification_get_body (notification)); */
+    g_signal_connect(notification, "closed",
+                     G_CALLBACK(notification_closed), NULL);
+
+    notifications += 1;
+
+    if (status_icon) {
+        update_status_icon(NULL, FALSE, TRUE, FALSE);
+    }
+
+    g_debug("New notification (%d active).\n", notifications);
 
     return FALSE;
 }
@@ -111,10 +282,24 @@ static gboolean decide_policy (WebKitWebView *view,
         break;
     default:
         /* Making no decision results in webkit_policy_decision_use(). */
+
         return FALSE;
     }
 
     return TRUE;
+}
+
+static gboolean delete_window(GtkWidget *widget, GdkEvent *event,
+                              gpointer user_data)
+{
+    if (0 && gtk_status_icon_is_embedded(status_icon)) {
+        g_debug("Status icon is embedded; window minimizing window to tray.\n");
+        gtk_widget_hide(widget);
+
+        return TRUE;
+    } else {
+        return FALSE;
+    }
 }
 
 static void destroy_window(GtkWidget *widget, GtkWidget *window)
@@ -128,56 +313,6 @@ static gboolean close_web_view(WebKitWebView *view, GtkWidget *window)
     return TRUE;
 }
 
-GdkFilterReturn event_filter (GdkXEvent *xevent, GdkEvent *event, gpointer data)
-{
-    XEvent *e;
-
-    e = (XEvent *)xevent;
-
-    switch(e->type) {
-    case Expose:
-        {
-            cairo_surface_t *window_surface;
-            cairo_t *cr;
-            XWindowAttributes wa;
-
-            XGetWindowAttributes(e->xany.display, e->xany.window, &wa);
-            window_surface = cairo_xlib_surface_create (e->xany.display,
-                                                        e->xany.window,
-                                                        wa.visual,
-                                                        wa.width,
-                                                        wa.height);
-
-            cr = cairo_create(window_surface);
-
-            cairo_scale (cr,
-                         (double)wa.width /
-                         cairo_image_surface_get_width (icon_surface),
-                         (double)wa.height /
-                         cairo_image_surface_get_height (icon_surface));
-
-            cairo_surface_flush(icon_surface);
-            cairo_set_source_surface(cr, icon_surface, 0, 0);
-            cairo_pattern_set_filter (cairo_get_source (cr), CAIRO_FILTER_BEST);
-            cairo_paint (cr);
-            cairo_destroy(cr);
-
-            cairo_surface_finish (window_surface);
-            cairo_surface_destroy(window_surface);
-
-            g_debug("Updated the status icon.\n");
-        }
-        break;
-
-    case ButtonPress: case ButtonRelease:
-        g_debug("Button pressed.\n");
-        break;
-    default: break;
-    }
-
-    return GDK_FILTER_CONTINUE;
-}
-
 static gboolean get_favicon(WebKitWebView *view,
                             GParamSpec *pspec,
                             GtkWindow *window)
@@ -186,133 +321,50 @@ static gboolean get_favicon(WebKitWebView *view,
 
     g_debug ("Favicon is available.");
 
-    if(icon_surface) {
-        g_object_unref (icon_surface);
+    if(favicon_surface) {
+        g_object_unref (favicon_surface);
+        favicon_surface = NULL;
     }
 
-    if (!(icon_surface = webkit_web_view_get_favicon (view))) {
+    if (!(favicon_surface = webkit_web_view_get_favicon (view))) {
         g_debug ("Could not get favicon surface.");
+
+        if (status_icon) {
+            gtk_status_icon_set_visible(status_icon, FALSE);
+            g_object_unref(G_OBJECT(status_icon));
+
+            status_icon = NULL;
+        }
+
         return TRUE;
     }
 
     if ((pixbuf = gdk_pixbuf_get_from_surface (
-            icon_surface, 0, 0,
-            cairo_image_surface_get_width (icon_surface),
-            cairo_image_surface_get_height (icon_surface)))) {
+            favicon_surface, 0, 0,
+            cairo_image_surface_get_width (favicon_surface),
+            cairo_image_surface_get_height (favicon_surface)))) {
         gtk_window_set_icon (window, pixbuf);
         g_object_unref(pixbuf);
     } else {
         g_debug ("Could not use favicon to set application window icon.");
     }
 
-    {
-        GdkWindow *icon;
-        GdkWindowAttr wa = {
-            .width = 0,
-            .height = 0,
-            .event_mask = (GDK_EXPOSURE_MASK | GDK_STRUCTURE_MASK |
-                           GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK),
-            .override_redirect = TRUE,
-            .wclass = GDK_INPUT_OUTPUT,
-            .window_type = GDK_WINDOW_TOPLEVEL,
-            .wmclass_name = "foo",
-            .wmclass_class = "Foo"
-        };
+    /* If we haven't already, create a status icon. */
 
-        Display *display;
-        Window tray;
-        Atom _NET_SYSTEM_TRAY_Sn, _NET_SYSTEM_TRAY_OPCODE, _XEMBED_INFO;
-        XEvent ev;
-        int screen;
+    if (want_status_icon) {
+        if (!status_icon) {
+            status_icon = gtk_status_icon_new ();
 
-        display = gdk_x11_get_default_xdisplay();
-        screen = gdk_x11_get_default_screen();
+            g_signal_connect(status_icon, "size-changed",
+                             G_CALLBACK(status_icon_size_changed), NULL);
 
-        {
-            gchar *name;
+            g_signal_connect(status_icon, "activate",
+                             G_CALLBACK(status_icon_activated), window);
 
-            name = g_strdup_printf("_NET_SYSTEM_TRAY_S%d", screen);
-            _NET_SYSTEM_TRAY_Sn = gdk_x11_get_xatom_by_name(name);
-            g_free(name);
+            gtk_status_icon_set_visible (status_icon, TRUE);
         }
 
-        _NET_SYSTEM_TRAY_OPCODE = gdk_x11_get_xatom_by_name("_NET_SYSTEM_TRAY_OPCODE");
-        _XEMBED_INFO = gdk_x11_get_xatom_by_name("_XEMBED_INFO");
-
-        g_debug ("Atoms: %d, %d\n", (int)_NET_SYSTEM_TRAY_Sn, (int)_NET_SYSTEM_TRAY_OPCODE);
-
-        tray = XGetSelectionOwner(display, _NET_SYSTEM_TRAY_Sn);
-
-        g_debug ("Tray: %d\n", (int)tray);
-
-        {
-            GdkScreen *gdk_screen;
-            Atom _NET_SYSTEM_TRAY_VISUAL, XA_VISUALID, type;
-            int format;
-            unsigned long n, m;
-            VisualID id;
-
-            _NET_SYSTEM_TRAY_VISUAL = gdk_x11_get_xatom_by_name("_NET_SYSTEM_TRAY_VISUAL");
-            XA_VISUALID = gdk_x11_get_xatom_by_name("XA_VISUALID");
-
-            XGetWindowProperty(display, tray, _NET_SYSTEM_TRAY_VISUAL,
-                               0, 65536, False, XA_VISUALID, &type, &format,
-                               &n, &m, (unsigned char **)&id);
-
-            g_debug ("VisualID: %x\n", (unsigned int)id);
-            gdk_screen = gdk_screen_get_default();
-
-            if (id) {
-                wa.visual = gdk_x11_screen_lookup_visual (gdk_screen, id);
-            } else {
-                wa.visual = gdk_screen_get_system_visual (gdk_screen);
-            }
-        }
-
-        icon = gdk_window_new(NULL, &wa,
-                              GDK_WA_WMCLASS | GDK_WA_VISUAL | GDK_WA_NOREDIR);
-        gdk_window_add_filter (icon, event_filter, NULL);
-
-        {
-            GList *icon_list = NULL;
-
-            icon_list = g_list_append (icon_list, pixbuf);
-            gdk_window_set_icon_list (icon, icon_list);
-        }
-
-        XSetWindowBackgroundPixmap(display, GDK_WINDOW_XID(icon), ParentRelative);
-
-        {
-            unsigned long xembed_info[2];
-
-            //Set XEMBED info
-            xembed_info[0] = 0;
-            xembed_info[1] = 1;
-            XChangeProperty(display,
-                            gdk_x11_window_get_xid (icon),
-                            _XEMBED_INFO, _XEMBED_INFO,
-                            32, PropModeReplace,
-                            (unsigned char*)xembed_info, 2);
-        }
-
-        memset(&ev, 0, sizeof(ev));
-        ev.xclient.type = ClientMessage;
-        ev.xclient.window = tray;
-        ev.xclient.message_type = _NET_SYSTEM_TRAY_OPCODE;
-        ev.xclient.format = 32;
-        ev.xclient.data.l[0] = CurrentTime;
-        ev.xclient.data.l[1] = 0;      /* SYSTEM_TRAY_REQUEST_DOCK */
-        ev.xclient.data.l[2] = gdk_x11_window_get_xid (icon);
-        ev.xclient.data.l[3] = 0;
-        ev.xclient.data.l[4] = 0;
-
-        /* trap_errors(); */
-        XSendEvent(display, tray, False, NoEventMask, &ev);
-        XSync(display, False);
-
-        /* if (untrap_errors()) { */
-        /*     /\* Handle failure *\/ */
-        /* } */
+        update_status_icon(NULL, TRUE, FALSE, FALSE);
     }
 
     return TRUE;
@@ -322,7 +374,16 @@ static gboolean get_title(WebKitWebView *view,
                           GParamSpec *pspec,
                           GtkWindow *window)
 {
-    gtk_window_set_title (window, webkit_web_view_get_title (view));
+    const char *title;
+
+    title = webkit_web_view_get_title (view);
+
+    gtk_window_set_title (window, title);
+
+    if (status_icon) {
+        update_status_icon(title, FALSE, FALSE, FALSE);
+    }
+
     return TRUE;
 }
 
@@ -353,6 +414,41 @@ static gboolean context_menu_handler (WebKitWebView *view,
     } else {
         return !(webkit_hit_test_result_context_is_editable(hit_test_result) ||
                  webkit_hit_test_result_context_is_selection(hit_test_result));
+    }
+}
+
+static void handle_script_message (WebKitUserContentManager *manager,
+                                   WebKitJavascriptResult *js_result,
+                                   gpointer user_data)
+{
+    JSGlobalContextRef global;
+    JSValueRef value;
+
+    value = webkit_javascript_result_get_value (js_result);
+    global = webkit_javascript_result_get_global_context (js_result);
+
+    if (JSValueIsString (global, value)) {
+        JSStringRef js_string;
+        gchar *message;
+        gsize n;
+
+        js_string = JSValueToStringCopy (global, value, NULL);
+        n = JSStringGetMaximumUTF8CStringSize (js_string);
+        message = (gchar *)g_malloc (n);
+        JSStringGetUTF8CString (js_string, message, n);
+        JSStringRelease (js_string);
+        g_print ("Script result: %s\n", message);
+        g_free (message);
+    } else if (JSValueIsBoolean (global, value)) {
+        alert = JSValueToBoolean(global, value);
+
+        if (status_icon) {
+            update_status_icon(NULL, FALSE, FALSE, TRUE);
+        }
+
+        g_debug ("Received bool script message: %d\n", alert);
+    } else {
+        g_warning ("Error running javascript: unexpected return value");
     }
 }
 
@@ -415,25 +511,58 @@ static gboolean add_permission (const gchar *option_name,
     return TRUE;
 }
 
+static gboolean add_user_asset (const gchar *option_name,
+                                const gchar *value,
+                                gpointer data,
+                                GError **error)
+{
+    int i;
+
+    if (!strcmp(option_name, "--script") ||
+        !strcmp(option_name, "-j")) {
+        i = 0;
+    } else if (!strcmp(option_name, "--style") ||
+        !strcmp(option_name, "-c")) {
+        i = 1;
+    } else {
+        g_assert_not_reached();
+    }
+
+    assets[i] = g_slist_prepend (assets[i], (gpointer)g_strdup(value));
+
+    return TRUE;
+}
+
 int main(int argc, char* argv[])
 {
-    char *url;
-
     GtkWidget *window;
     WebKitWebView *view;
     WebKitWebContext *context;
+    WebKitUserContentManager *content;
 
     GError *error = NULL;
+    GSList *s;
+
+    char *url;
+    int i;
 
     GOptionEntry options[] = {
+        {"script", 'j', G_OPTION_FLAG_NONE, G_OPTION_ARG_CALLBACK,
+         &add_user_asset, "Add a user script", "FILE"},
+        {"style", 'c', G_OPTION_FLAG_NONE, G_OPTION_ARG_CALLBACK,
+         &add_user_asset, "Add a user style sheet", "FILE"},
         {"permit", 'p', G_OPTION_FLAG_NONE, G_OPTION_ARG_CALLBACK,
-         &add_permission, "Permit a certain type of request.", "REQUEST"},
+         &add_permission, "Permit a certain type of request", "REQUEST"},
         {"spell", 's', G_OPTION_FLAG_NONE, G_OPTION_ARG_CALLBACK,
-         &add_language, "Add spell checker language.", "LANG"},
+         &add_language, "Add spell checker language", "LANG"},
         {"lang", 'l', G_OPTION_FLAG_NONE, G_OPTION_ARG_CALLBACK,
-         &add_language, "Add preferred language.", "LANG"},
+         &add_language, "Add preferred language", "LANG"},
         {"url", 'u', G_OPTION_FLAG_NONE, G_OPTION_ARG_STRING, &url,
-         "The wrapped URL.", "URL"},
+         "The wrapped URL", "URL"},
+        {"tray", 't', G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE, &want_status_icon,
+         "Add an icon to the system tray", NULL},
+        {"zoom", 'z', G_OPTION_FLAG_NONE, G_OPTION_ARG_DOUBLE, &zoom,
+         "The zoom level", NULL},
         {NULL}
     };
 
@@ -446,6 +575,58 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    /* Create a user content manager. */
+
+    content = webkit_user_content_manager_new ();
+
+    g_signal_connect (content, "script-message-received::alerts",
+                      G_CALLBACK (handle_script_message), NULL);
+    webkit_user_content_manager_register_script_message_handler (
+        content, "alerts");
+
+    /* Load user-provided scripts and style sheets. */
+
+    for (i = 0 ; i < 2 ; i += 1) {
+        for (s = assets[i] ; s ; s = s->next) {
+            gchar *source;
+
+            GError *error = NULL;
+
+            if (!g_file_get_contents (s->data, &source, NULL, &error)) {
+                fprintf (stderr, "Could not read asset source: %s\n",
+                         error->message);
+                g_error_free (error);
+            } else if (i == 0) {
+                WebKitUserScript *script;
+
+                script = webkit_user_script_new (
+                    source,
+                    WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                    WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+                    NULL, NULL);
+
+                webkit_user_content_manager_add_script(content, script);
+
+                g_debug ("Added user script %s.\n", (gchar *)s->data);
+            } else {
+                WebKitUserStyleSheet *sheet;
+
+                sheet = webkit_user_style_sheet_new (
+                    source,
+                    WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                    WEBKIT_USER_STYLE_LEVEL_USER,
+                    NULL, NULL);
+
+                webkit_user_content_manager_add_style_sheet(content, sheet);
+
+                g_debug ("Added user style sheet %s.\n", (gchar *)s->data);
+            }
+
+            g_free(source);
+        }
+
+        g_slist_free_full (assets[i], g_free);
+    }
     /* Create a WebKit context. */
 
     {
@@ -484,7 +665,7 @@ int main(int argc, char* argv[])
             webkit_web_context_set_spell_checking_enabled (context, TRUE);
         }
 
-        /* Free the langague vectors. */
+        /* Free the language vectors. */
 
         for (j = 0 ; j < 2 ; j += 1) {
             for (i = 0 ; languages[j][i] ; i += 1) {
@@ -497,11 +678,17 @@ int main(int argc, char* argv[])
 
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_default_size(GTK_WINDOW(window), 800, 600);
-    view = WEBKIT_WEB_VIEW(webkit_web_view_new_with_context(context));
+    view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                                        "user-content-manager", content,
+                                        "web-context", context,
+                                        NULL
+));
+    webkit_web_view_set_zoom_level(view, zoom);
     gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(view));
 
     /* Set up signals. */
 
+    g_signal_connect(window, "delete_event", G_CALLBACK (delete_window), NULL);
     g_signal_connect(window, "destroy", G_CALLBACK(destroy_window), NULL);
     g_signal_connect(view, "close", G_CALLBACK(close_web_view), window);
     g_signal_connect(view, "permission-request",
@@ -527,6 +714,11 @@ int main(int argc, char* argv[])
     /* Run the main GTK+ event loop. */
 
     gtk_main();
+
+    if (status_icon) {
+        gtk_status_icon_set_visible(status_icon, FALSE);
+        g_object_unref(G_OBJECT(status_icon));
+    }
 
     return 0;
 }
