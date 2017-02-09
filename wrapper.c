@@ -8,9 +8,11 @@
 
 static GtkStatusIcon *status_icon;
 static cairo_surface_t *favicon_surface;
-static int notifications, alert, want_status_icon;
+static int notifications, alert;
+static int want_status_icon, want_notifications;
 
 static GSList *assets[2];
+static const GRegex *internal_urls_regex;
 
 static gchar *languages[2][8];
 static gboolean permissions[4];
@@ -219,8 +221,13 @@ static gboolean show_notification (WebKitWebView *view,
                                    WebKitNotification *notification,
                                    gpointer user_data)
 {
-    g_signal_connect(notification, "closed",
-                     G_CALLBACK(notification_closed), NULL);
+    /* Bind a handler to keep track of the notification's state, if
+     * we're handling notifications that way. */
+
+    if (want_notifications == 1) {
+        g_signal_connect(notification, "closed",
+                         G_CALLBACK(notification_closed), NULL);
+    }
 
     notifications += 1;
 
@@ -242,23 +249,40 @@ static gboolean decide_policy (WebKitWebView *view,
     WebKitNavigationAction *action;
     WebKitNavigationType type;
     WebKitURIRequest *request;
+    const gchar *uri;
 
     switch (decision_type) {
-    case WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION:
     case WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION:
+        return FALSE;
+
+    case WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION:
         navigation = WEBKIT_NAVIGATION_POLICY_DECISION (decision);
         action = webkit_navigation_policy_decision_get_navigation_action (navigation);
+        request = webkit_navigation_action_get_request(action);
+        uri = webkit_uri_request_get_uri(request);
         type = webkit_navigation_action_get_navigation_type(action);
 
         switch (type) {
         case WEBKIT_NAVIGATION_TYPE_LINK_CLICKED:
-            request = webkit_navigation_action_get_request(action);
+            g_debug("Need to make a navigation policy decision for "
+                    "link to '%s'.\n", uri);
+
+            g_debug(decision_type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION ?
+                    "Should open in same window." : "Should open in new window.");
+
+            if(internal_urls_regex &&
+               g_regex_match (internal_urls_regex, uri, 0, NULL)) {
+                g_debug("Opening URL '%s' internally.\n", uri);
+                webkit_web_view_load_uri(view, uri);
+                return FALSE;
+            }
+
+            g_debug("Launching URL '%s' externally.\n", uri);
 
             {
                 GError *error = NULL;
 
-                if (!g_app_info_launch_default_for_uri (
-                        webkit_uri_request_get_uri(request), NULL, &error) &&
+                if (!g_app_info_launch_default_for_uri (uri, NULL, &error) &&
                     error != NULL) {
                     fprintf (stderr, "Could not launch URI: %s\n",
                              error->message);
@@ -272,6 +296,7 @@ static gboolean decide_policy (WebKitWebView *view,
         case WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED:
         case WEBKIT_NAVIGATION_TYPE_FORM_RESUBMITTED:
         case WEBKIT_NAVIGATION_TYPE_OTHER:
+            g_debug("Handling non-click navigation to URL '%s'.\n", uri);
             return FALSE;
 
         case WEBKIT_NAVIGATION_TYPE_BACK_FORWARD:
@@ -287,6 +312,17 @@ static gboolean decide_policy (WebKitWebView *view,
     }
 
     return TRUE;
+}
+
+static gboolean focus_view (GtkWidget *widget, GdkEvent *event, gpointer user_data)
+{
+    notifications = 0;
+
+    if (status_icon) {
+        update_status_icon(NULL, FALSE, TRUE, FALSE);
+    }
+
+    return FALSE;
 }
 
 static gboolean delete_window(GtkWidget *widget, GdkEvent *event,
@@ -511,6 +547,28 @@ static gboolean add_permission (const gchar *option_name,
     return TRUE;
 }
 
+static gboolean select_notification_method (const gchar *option_name,
+                                            const gchar *value,
+                                            gpointer data,
+                                            GError **error)
+{
+    if (!strcmp(value, "lifecycle")) {
+        want_notifications = 1;
+    } else if (!strcmp(value, "focus")) {
+        want_notifications = 2;
+    } else {
+        g_set_error(error,
+                    G_OPTION_ERROR,
+                    G_OPTION_ERROR_BAD_VALUE,
+                    "Unknown type of notification mode '%s' "
+                    "supplied to --notifications.", value);
+
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 static gboolean add_user_asset (const gchar *option_name,
                                 const gchar *value,
                                 gpointer data,
@@ -529,6 +587,31 @@ static gboolean add_user_asset (const gchar *option_name,
     }
 
     assets[i] = g_slist_prepend (assets[i], (gpointer)g_strdup(value));
+
+    return TRUE;
+}
+
+static gboolean set_internal_url_pattern(const gchar *option_name,
+                                         const gchar *value,
+                                         gpointer data,
+                                         GError **error)
+{
+    GError *regex_error = NULL;
+
+    internal_urls_regex = g_regex_new(value, G_REGEX_OPTIMIZE,
+                                    G_REGEX_MATCH_NOTEMPTY,
+                                    &regex_error);
+
+    if (!internal_urls_regex  && regex_error != NULL) {
+        g_set_error(error,
+                    G_OPTION_ERROR,
+                    G_OPTION_ERROR_BAD_VALUE,
+                    "Could not parse URL pattern '%s'.", value);
+
+        g_error_free (regex_error);
+
+        return FALSE;
+    }
 
     return TRUE;
 }
@@ -563,6 +646,12 @@ int main(int argc, char* argv[])
          "Add an icon to the system tray", NULL},
         {"zoom", 'z', G_OPTION_FLAG_NONE, G_OPTION_ARG_DOUBLE, &zoom,
          "The zoom level", NULL},
+        {"notifications", 'n', G_OPTION_FLAG_NONE, G_OPTION_ARG_CALLBACK,
+         &select_notification_method,
+         "Track pending notifications with the specified method.", "METHOD"},
+        {"internal", 'i', G_OPTION_FLAG_NONE, G_OPTION_ARG_CALLBACK,
+         &set_internal_url_pattern,
+         "Set pattern of URLs to open within the wrapper.", "REGEX"},
         {NULL}
     };
 
@@ -693,14 +782,26 @@ int main(int argc, char* argv[])
     g_signal_connect(view, "close", G_CALLBACK(close_web_view), window);
     g_signal_connect(view, "permission-request",
                      G_CALLBACK(permission_request), NULL);
-    g_signal_connect (view, "show-notification",
-                      G_CALLBACK (show_notification), NULL);
     g_signal_connect (view, "decide-policy",
                       G_CALLBACK (decide_policy), NULL);
     g_signal_connect(view, "notify::favicon", G_CALLBACK(get_favicon), window);
     g_signal_connect(view, "notify::title", G_CALLBACK(get_title), window);
     g_signal_connect (view, "context-menu",
                       G_CALLBACK (context_menu_handler), NULL);
+
+    /* Bind a handler to keep track of notifications, if requested. */
+
+    if (want_notifications) {
+        g_signal_connect (view, "show-notification",
+                          G_CALLBACK (show_notification), NULL);
+    }
+
+    /* Bind a handler to keep track of the view's focus state, to
+     * clear pending notifications if that mode was selected. */
+
+    if (want_notifications == 2) {
+        g_signal_connect(view, "focus-in-event", G_CALLBACK(focus_view), NULL);
+    }
 
     /* Load the specified web page and show the window. */
 
